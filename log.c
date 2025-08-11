@@ -6,6 +6,8 @@
 
 #define MAX_CALLBACKS 32
 #define LOG_FIXED_RECORD_SIZE 128
+#define DEFAULT_ROLLING_MAX_LINES 100
+#define DEFAULT_ROLLING_PATH "rolling.log"
 
 #ifdef _MSC_VER
 #define SNPRINTF _snprintf
@@ -80,6 +82,9 @@ typedef struct {
 #define MAX_ROLLING_CTX 32
 static RollingFileCtx *g_rolling_ctx[MAX_ROLLING_CTX];
 
+// Internal rolling file
+static RollingFileCtx *g_default_rolling_ctx = NULL;
+
 static void register_rolling_ctx(RollingFileCtx *ctx) {
     for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
         if (g_rolling_ctx[i] == NULL) {
@@ -119,6 +124,14 @@ static RollingFileCtx *rolling_ctx_create(FILE *fp, size_t max_lines) {
     }
     register_rolling_ctx(ctx);
     return ctx;
+}
+
+static void ensure_default_rolling_initialized(void) {
+    if (g_default_rolling_ctx) return;
+    FILE *fp = fopen(DEFAULT_ROLLING_PATH, "r+b");
+    if (!fp) fp = fopen(DEFAULT_ROLLING_PATH, "w+b");
+    if (!fp) return;
+    g_default_rolling_ctx = rolling_ctx_create(fp, DEFAULT_ROLLING_MAX_LINES);
 }
 
 static void rolling_file_callback(log_Event *ev) {
@@ -194,26 +207,26 @@ int log_add_callback(log_LogFn fn, void *udata, int level) {
 
 int log_add_fp(FILE *fp, int level) { return log_add_callback(file_callback, fp, level); }
 
-int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
-    RollingFileCtx *ctx = rolling_ctx_create(fp, max_lines);
-    if (!ctx) return -1;
-    return log_add_callback(rolling_file_callback, ctx, level);
+static int log_add_default_rolling_if_needed(void) {
+    ensure_default_rolling_initialized();
+    if (!g_default_rolling_ctx) return -1;
+    // Check if already registered as a callback
+    for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
+        if (L.callbacks[i].fn == rolling_file_callback && L.callbacks[i].udata == g_default_rolling_ctx) {
+            return 0;
+        }
+    }
+    return log_add_callback(rolling_file_callback, g_default_rolling_ctx, L.level);
 }
 
-int log_dump_rolling(FILE *fp, FILE *out) {
-    RollingFileCtx *ctx = find_rolling_ctx(fp);
-    if (!ctx || !ctx->fp || ctx->max_lines == 0) return -1;
-
-    // Determine starting slot: the oldest record is at current_index when buffer full,
-    // else at 0. We will read valid_records entries chronologically.
+// Optionally, for internal debugging: dump chronological to stderr
+static void dump_default_rolling_chronological_to(FILE *out) {
+    if (!g_default_rolling_ctx || !g_default_rolling_ctx->fp) return;
+    RollingFileCtx *ctx = g_default_rolling_ctx;
     size_t total = ctx->valid_records;
-    if (total == 0) return 0;
-
+    if (total == 0) return;
     size_t start = (ctx->valid_records == ctx->max_lines) ? ctx->current_index : 0;
-
-    // Flush file to ensure latest writes are visible
     fflush(ctx->fp);
-
     char record[LOG_FIXED_RECORD_SIZE];
     for (size_t i = 0; i < total; ++i) {
         size_t slot = (start + i) % ctx->max_lines;
@@ -224,16 +237,6 @@ int log_dump_rolling(FILE *fp, FILE *out) {
         fwrite(record, 1, LOG_FIXED_RECORD_SIZE, out);
     }
     fflush(out);
-    return 0;
-}
-
-int log_get_rolling_position(FILE *fp, size_t *current_index, size_t *max_lines, size_t *valid_records) {
-    RollingFileCtx *ctx = find_rolling_ctx(fp);
-    if (!ctx) return -1;
-    if (current_index) *current_index = ctx->current_index;
-    if (max_lines) *max_lines = ctx->max_lines;
-    if (valid_records) *valid_records = ctx->valid_records;
-    return 0;
 }
 
 static void init_event(log_Event *ev, void *udata) {
@@ -253,6 +256,9 @@ void log_log(int level, const char *file, int line, const char *fmt, ...) {
     ev.time = NULL;
 
     lock();
+
+    // Ensure default rolling logger is installed
+    log_add_default_rolling_if_needed();
 
     if (!L.quiet && level >= L.level) {
         init_event(&ev, stderr);
