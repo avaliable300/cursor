@@ -38,5 +38,22 @@ int main(void) {
 
     log_warn("Done. Check normal.log and rolling.log");
 
+    // Dump chronological view of rolling.log to a separate file and stdout
+    FILE *chron = fopen("rolling_chronological.log", "w+b");
+    if (chron && rolling) {
+        if (log_dump_rolling(rolling, chron) != 0) {
+            log_error("Failed to dump rolling chronologically to file");
+        }
+        fflush(chron);
+        fseek(chron, 0, SEEK_SET);
+        // Also mirror to stdout for quick inspection
+        char buf[256];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), chron)) > 0) {
+            fwrite(buf, 1, n, stdout);
+        }
+        fclose(chron);
+    }
+
     return 0;
 }

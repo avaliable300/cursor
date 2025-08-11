@@ -73,7 +73,28 @@ typedef struct {
     FILE *fp;
     size_t max_lines;
     size_t current_index;
+    size_t valid_records; // how many records are valid (<= max_lines)
 } RollingFileCtx;
+
+// Keep a simple registry to map FILE* to RollingFileCtx for dump/query
+#define MAX_ROLLING_CTX 32
+static RollingFileCtx *g_rolling_ctx[MAX_ROLLING_CTX];
+
+static void register_rolling_ctx(RollingFileCtx *ctx) {
+    for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
+        if (g_rolling_ctx[i] == NULL) {
+            g_rolling_ctx[i] = ctx;
+            return;
+        }
+    }
+}
+
+static RollingFileCtx *find_rolling_ctx(FILE *fp) {
+    for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
+        if (g_rolling_ctx[i] && g_rolling_ctx[i]->fp == fp) return g_rolling_ctx[i];
+    }
+    return NULL;
+}
 
 static RollingFileCtx *rolling_ctx_create(FILE *fp, size_t max_lines) {
     RollingFileCtx *ctx = (RollingFileCtx *)malloc(sizeof(RollingFileCtx));
@@ -81,6 +102,7 @@ static RollingFileCtx *rolling_ctx_create(FILE *fp, size_t max_lines) {
     ctx->fp = fp;
     ctx->max_lines = max_lines ? max_lines : 1;
     ctx->current_index = 0;
+    ctx->valid_records = 0;
 
     if (fp) {
         long cur = ftell(fp);
@@ -90,10 +112,12 @@ static RollingFileCtx *rolling_ctx_create(FILE *fp, size_t max_lines) {
             if (size > 0) {
                 size_t written_records = (size_t)(size / LOG_FIXED_RECORD_SIZE);
                 ctx->current_index = written_records % ctx->max_lines;
+                ctx->valid_records = written_records > ctx->max_lines ? ctx->max_lines : written_records;
             }
             fseek(fp, cur, SEEK_SET);
         }
     }
+    register_rolling_ctx(ctx);
     return ctx;
 }
 
@@ -128,8 +152,9 @@ static void rolling_file_callback(log_Event *ev) {
     fwrite(record, 1, sizeof(record), ctx->fp);
     fflush(ctx->fp);
 
-    // Advance circular index
+    // Advance circular index and valid count
     ctx->current_index = (ctx->current_index + 1) % ctx->max_lines;
+    if (ctx->valid_records < ctx->max_lines) ctx->valid_records++;
 }
 
 static void lock(void) {
@@ -173,6 +198,42 @@ int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
     RollingFileCtx *ctx = rolling_ctx_create(fp, max_lines);
     if (!ctx) return -1;
     return log_add_callback(rolling_file_callback, ctx, level);
+}
+
+int log_dump_rolling(FILE *fp, FILE *out) {
+    RollingFileCtx *ctx = find_rolling_ctx(fp);
+    if (!ctx || !ctx->fp || ctx->max_lines == 0) return -1;
+
+    // Determine starting slot: the oldest record is at current_index when buffer full,
+    // else at 0. We will read valid_records entries chronologically.
+    size_t total = ctx->valid_records;
+    if (total == 0) return 0;
+
+    size_t start = (ctx->valid_records == ctx->max_lines) ? ctx->current_index : 0;
+
+    // Flush file to ensure latest writes are visible
+    fflush(ctx->fp);
+
+    char record[LOG_FIXED_RECORD_SIZE];
+    for (size_t i = 0; i < total; ++i) {
+        size_t slot = (start + i) % ctx->max_lines;
+        long offset = (long)slot * (long)LOG_FIXED_RECORD_SIZE;
+        fseek(ctx->fp, offset, SEEK_SET);
+        size_t n = fread(record, 1, LOG_FIXED_RECORD_SIZE, ctx->fp);
+        if (n != LOG_FIXED_RECORD_SIZE) break;
+        fwrite(record, 1, LOG_FIXED_RECORD_SIZE, out);
+    }
+    fflush(out);
+    return 0;
+}
+
+int log_get_rolling_position(FILE *fp, size_t *current_index, size_t *max_lines, size_t *valid_records) {
+    RollingFileCtx *ctx = find_rolling_ctx(fp);
+    if (!ctx) return -1;
+    if (current_index) *current_index = ctx->current_index;
+    if (max_lines) *max_lines = ctx->max_lines;
+    if (valid_records) *valid_records = ctx->valid_records;
+    return 0;
 }
 
 static void init_event(log_Event *ev, void *udata) {

@@ -48,6 +48,13 @@ int log_add_fp(FILE *fp, int level);
 // Rolling fixed-size (128 bytes) circular logger
 int log_add_rolling_fp(FILE *fp, int level, size_t max_lines);
 
+// Dump rolling fixed-size log in chronological order to 'out'.
+// Returns 0 on success, -1 if no rolling context bound to this FILE*.
+int log_dump_rolling(FILE *fp, FILE *out);
+
+// Optionally query rolling position; returns 0 on success, -1 on failure.
+int log_get_rolling_position(FILE *fp, size_t *current_index, size_t *max_lines, size_t *valid_records);
+
 // Core log function
 void log_log(int level, const char *file, int line, const char *fmt, ...);
 
