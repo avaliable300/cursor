@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <limits.h>
 
 // 前置声明以确保一致的类型标记
 struct log_Event; // forward declaration for typedef
@@ -414,18 +415,19 @@ static void rolling_file_callback(struct log_Event* ev) {
     }
     record[ROLLING_RECORD_SIZE - 1] = '\n';
 
-    // 计算写入偏移
+    // 计算写入偏移（使用 fseek 兼容 Windows/Linux）
     size_t target_index = state->current_line_index % state->max_lines;
-    off_t offset = (off_t)(target_index * ROLLING_RECORD_SIZE);
+    unsigned long ul_offset = (unsigned long)(target_index * (size_t)ROLLING_RECORD_SIZE);
+    if (ul_offset > (unsigned long)LONG_MAX) {
+        // 理论上不应发生，因为 max_lines 在注册时已被限制
+        ul_offset = (unsigned long)LONG_MAX;
+    }
+    long offset = (long)ul_offset;
 
     // 定位并写入
-#if defined(_WIN32)
-    _fseeki64(state->file_stream, offset, SEEK_SET);
-#else
-    fseeko(state->file_stream, (off_t)offset, SEEK_SET);
-#endif
+    fseek(state->file_stream, offset, SEEK_SET);
     size_t written = fwrite(record, 1, sizeof(record), state->file_stream);
-    (void)written; // 对于失败情况，可按需扩展处理
+    (void)written;
     fflush(state->file_stream);
 
     state->current_line_index = (state->current_line_index + 1) % state->max_lines;
@@ -618,29 +620,37 @@ int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
     }
     if (!state) return -1; // 无可用槽位
 
+    // 根据 fseek 的可寻址范围限制 max_lines
+    unsigned long max_records_supported = (unsigned long)(LONG_MAX / ROLLING_RECORD_SIZE);
+    size_t capped_max_lines = max_lines;
+    if ((unsigned long)max_lines > max_records_supported) {
+        capped_max_lines = (size_t)max_records_supported;
+    }
+
     // 初始化状态
     memset(state, 0, sizeof(*state));
     state->file_stream = fp;
-    state->max_lines = max_lines;
+    state->max_lines = capped_max_lines;
     state->current_line_index = 0;
     state->try_remove_append_flag = true; // 第一次写前尝试移除 O_APPEND
     state->in_use = true;
 
-    // 计算当前行位置（基于文件长度）
-#if defined(LINUX)
-    off_t old_pos = ftello(fp);
-    (void)old_pos;
-    if (fseeko(fp, 0, SEEK_END) == 0) {
-        off_t len = ftello(fp);
-        if (len > 0) {
-            size_t records = (size_t)(len / ROLLING_RECORD_SIZE);
-            if (records > 0) state->current_line_index = records % max_lines;
+    // 计算当前行位置（基于文件长度，使用 fseek/ftell）
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    if (len > 0) {
+        size_t records = (size_t)((unsigned long)len / (unsigned long)ROLLING_RECORD_SIZE);
+        if (records > 0 && state->max_lines > 0) {
+            state->current_line_index = records % state->max_lines;
         }
     }
-    // 可选：预分配文件大小
+
+    // 可选（Linux）：预分配文件大小
+#if defined(LINUX)
     int fd = fileno(fp);
     if (fd >= 0) {
-        off_t target = (off_t)(max_lines * ROLLING_RECORD_SIZE);
+        unsigned long target_ul = (unsigned long)(state->max_lines * (size_t)ROLLING_RECORD_SIZE);
+        off_t target = (off_t)target_ul;
         struct stat st;
         if (fstat(fd, &st) == 0) {
             if (st.st_size < target) {
@@ -648,14 +658,6 @@ int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
                 (void)rc_trunc;
             }
         }
-    }
-#else
-    // 其他平台简单基于现有大小估算
-    fseek(fp, 0, SEEK_END);
-    long len = ftell(fp);
-    if (len > 0) {
-        size_t records = (size_t)(len / ROLLING_RECORD_SIZE);
-        if (records > 0) state->current_line_index = records % max_lines;
     }
 #endif
 
