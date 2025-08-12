@@ -15,6 +15,15 @@
 #define SNPRINTF snprintf
 #endif
 
+static size_t safe_strnlen(const char *s, size_t maxlen) {
+    size_t i = 0;
+    if (!s) return 0;
+    for (; i < maxlen; ++i) {
+        if (s[i] == '\0') break;
+    }
+    return i;
+}
+
 typedef struct {
     log_LogFn fn;
     void *udata;
@@ -72,73 +81,35 @@ static void file_callback(log_Event *ev) {
 
 // Rolling file context that manages circular 128-byte records
 typedef struct {
+    bool used;
     FILE *fp;
     size_t max_lines;
     size_t current_index;
     size_t valid_records; // how many records are valid (<= max_lines)
 } RollingFileCtx;
 
-// Keep a simple registry to map FILE* to RollingFileCtx for dump/query
 #define MAX_ROLLING_CTX 32
-static RollingFileCtx *g_rolling_ctx[MAX_ROLLING_CTX];
+static RollingFileCtx g_rolling_ctx[MAX_ROLLING_CTX];
 
-// Internal rolling file
-static RollingFileCtx *g_default_rolling_ctx = NULL;
-
-static void register_rolling_ctx(RollingFileCtx *ctx) {
+static RollingFileCtx *alloc_rolling_ctx(void) {
     for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
-        if (g_rolling_ctx[i] == NULL) {
-            g_rolling_ctx[i] = ctx;
-            return;
+        if (!g_rolling_ctx[i].used) {
+            g_rolling_ctx[i].used = true;
+            g_rolling_ctx[i].fp = NULL;
+            g_rolling_ctx[i].max_lines = 0;
+            g_rolling_ctx[i].current_index = 0;
+            g_rolling_ctx[i].valid_records = 0;
+            return &g_rolling_ctx[i];
         }
-    }
-}
-
-static RollingFileCtx *find_rolling_ctx(FILE *fp) {
-    for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
-        if (g_rolling_ctx[i] && g_rolling_ctx[i]->fp == fp) return g_rolling_ctx[i];
     }
     return NULL;
 }
 
-static RollingFileCtx *rolling_ctx_create(FILE *fp, size_t max_lines) {
-    RollingFileCtx *ctx = (RollingFileCtx *)malloc(sizeof(RollingFileCtx));
-    if (!ctx) return NULL;
-    ctx->fp = fp;
-    ctx->max_lines = max_lines ? max_lines : 1;
-    ctx->current_index = 0;
-    ctx->valid_records = 0;
-
-    if (fp) {
-        long cur = ftell(fp);
-        if (cur < 0) cur = 0;
-        if (fseek(fp, 0, SEEK_END) == 0) {
-            long size = ftell(fp);
-            if (size > 0) {
-                size_t written_records = (size_t)(size / LOG_FIXED_RECORD_SIZE);
-                ctx->current_index = written_records % ctx->max_lines;
-                ctx->valid_records = written_records > ctx->max_lines ? ctx->max_lines : written_records;
-            }
-            fseek(fp, cur, SEEK_SET);
-        }
-    }
-    register_rolling_ctx(ctx);
-    return ctx;
-}
-
-static void ensure_default_rolling_initialized(void) {
-    if (g_default_rolling_ctx) return;
-    FILE *fp = fopen(DEFAULT_ROLLING_PATH, "r+b");
-    if (!fp) fp = fopen(DEFAULT_ROLLING_PATH, "w+b");
-    if (!fp) return;
-    g_default_rolling_ctx = rolling_ctx_create(fp, DEFAULT_ROLLING_MAX_LINES);
-}
-
 static void rolling_file_callback(log_Event *ev) {
     RollingFileCtx *ctx = (RollingFileCtx *)ev->udata;
-    if (!ctx || !ctx->fp || ctx->max_lines == 0) return;
+    if (!ctx || !ctx->used || !ctx->fp || ctx->max_lines == 0) return;
 
-    // Timestamp similar to other callbacks
+    // Timestamp
     char ts[32];
     time_t timep;
     time(&timep);
@@ -147,25 +118,37 @@ static void rolling_file_callback(log_Event *ev) {
              1900 + pt->tm_year, 1 + pt->tm_mon, pt->tm_mday,
              (8 + pt->tm_hour) % 24, pt->tm_min, pt->tm_sec);
 
-    // Format message body first using the va_list
-    char msg[512];
-    vsnprintf(msg, sizeof(msg), ev->fmt, ev->ap);
+    // Build the full line into a temporary buffer (text only)
+    char linebuf[1024];
+    int header_len = SNPRINTF(linebuf, sizeof(linebuf), "%s %-5s %s:%d: ",
+                              ts, level_strings[ev->level], ev->file, ev->line);
+    if (header_len < 0) header_len = 0;
+    size_t pos = (size_t)header_len;
+    if (pos > sizeof(linebuf)) pos = sizeof(linebuf);
 
-    // Compose a fixed-size 128-byte record: pad with spaces and end with '\n'
+    // Append message
+    if (pos < sizeof(linebuf)) {
+        int remain = (int)(sizeof(linebuf) - pos);
+        int wrote = vsnprintf(linebuf + pos, (size_t)remain, ev->fmt, ev->ap);
+        if (wrote < 0) wrote = 0;
+        // Do not rely on terminating NUL; we will copy explicit length below
+    }
+
+    // Create a 128-byte record with no NUL bytes: copy visible chars, pad with spaces, last byte is '\n'
     char record[LOG_FIXED_RECORD_SIZE];
     memset(record, ' ', sizeof(record));
-    // Leave the final byte for '\n'
-    SNPRINTF(record, LOG_FIXED_RECORD_SIZE - 1, "%s %-5s %s:%d: %s",
-             ts, level_strings[ev->level], ev->file, ev->line, msg);
+
+    // Compute visible length (stop at first NUL if any)
+    size_t visible_len = safe_strnlen(linebuf, sizeof(linebuf));
+    if (visible_len > LOG_FIXED_RECORD_SIZE - 1) visible_len = LOG_FIXED_RECORD_SIZE - 1;
+    memcpy(record, linebuf, visible_len);
     record[LOG_FIXED_RECORD_SIZE - 1] = '\n';
 
-    // Seek to the correct slot and overwrite
     long offset = (long)(ctx->current_index % ctx->max_lines) * (long)LOG_FIXED_RECORD_SIZE;
     fseek(ctx->fp, offset, SEEK_SET);
     fwrite(record, 1, sizeof(record), ctx->fp);
     fflush(ctx->fp);
 
-    // Advance circular index and valid count
     ctx->current_index = (ctx->current_index + 1) % ctx->max_lines;
     if (ctx->valid_records < ctx->max_lines) ctx->valid_records++;
 }
@@ -207,36 +190,37 @@ int log_add_callback(log_LogFn fn, void *udata, int level) {
 
 int log_add_fp(FILE *fp, int level) { return log_add_callback(file_callback, fp, level); }
 
-static int log_add_default_rolling_if_needed(void) {
-    ensure_default_rolling_initialized();
-    if (!g_default_rolling_ctx) return -1;
-    // Check if already registered as a callback
-    for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
-        if (L.callbacks[i].fn == rolling_file_callback && L.callbacks[i].udata == g_default_rolling_ctx) {
-            return 0;
-        }
-    }
-    return log_add_callback(rolling_file_callback, g_default_rolling_ctx, L.level);
-}
+int add_rolling_log(const char *path, size_t max_lines, int level) {
+    if (!path || max_lines == 0) return -1;
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) fp = fopen(path, "w+b");
+    if (!fp) return -1;
 
-// Optionally, for internal debugging: dump chronological to stderr
-static void dump_default_rolling_chronological_to(FILE *out) {
-    if (!g_default_rolling_ctx || !g_default_rolling_ctx->fp) return;
-    RollingFileCtx *ctx = g_default_rolling_ctx;
-    size_t total = ctx->valid_records;
-    if (total == 0) return;
-    size_t start = (ctx->valid_records == ctx->max_lines) ? ctx->current_index : 0;
-    fflush(ctx->fp);
-    char record[LOG_FIXED_RECORD_SIZE];
-    for (size_t i = 0; i < total; ++i) {
-        size_t slot = (start + i) % ctx->max_lines;
-        long offset = (long)slot * (long)LOG_FIXED_RECORD_SIZE;
-        fseek(ctx->fp, offset, SEEK_SET);
-        size_t n = fread(record, 1, LOG_FIXED_RECORD_SIZE, ctx->fp);
-        if (n != LOG_FIXED_RECORD_SIZE) break;
-        fwrite(record, 1, LOG_FIXED_RECORD_SIZE, out);
+    RollingFileCtx *ctx = alloc_rolling_ctx();
+    if (!ctx) {
+        fclose(fp);
+        return -1;
     }
-    fflush(out);
+
+    ctx->fp = fp;
+    ctx->max_lines = max_lines;
+    ctx->current_index = 0;
+    ctx->valid_records = 0;
+
+    // Initialize position from existing file size
+    long cur = ftell(fp);
+    if (cur < 0) cur = 0;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        long size = ftell(fp);
+        if (size > 0) {
+            size_t written_records = (size_t)(size / LOG_FIXED_RECORD_SIZE);
+            ctx->current_index = written_records % ctx->max_lines;
+            ctx->valid_records = written_records > ctx->max_lines ? ctx->max_lines : written_records;
+        }
+        fseek(fp, cur, SEEK_SET);
+    }
+
+    return log_add_callback(rolling_file_callback, ctx, level);
 }
 
 static void init_event(log_Event *ev, void *udata) {
@@ -256,9 +240,6 @@ void log_log(int level, const char *file, int line, const char *fmt, ...) {
     ev.time = NULL;
 
     lock();
-
-    // Ensure default rolling logger is installed
-    log_add_default_rolling_if_needed();
 
     if (!L.quiet && level >= L.level) {
         init_event(&ev, stderr);

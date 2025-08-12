@@ -45,6 +45,9 @@ void log_set_quiet(bool enable);
 int log_add_callback(log_LogFn fn, void *udata, int level);
 int log_add_fp(FILE *fp, int level);
 
+// Enable fixed-size (128B) rolling log to a file path without changing other structures
+int add_rolling_log(const char *path, size_t max_lines, int level);
+
 // Core log function
 void log_log(int level, const char *file, int line, const char *fmt, ...);
 

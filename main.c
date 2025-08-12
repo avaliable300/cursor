@@ -4,21 +4,18 @@
 #include <stdlib.h>
 
 int main(void) {
-    // Set log level to show everything
     log_set_level(LOG_TRACE);
 
-    // Log to stderr (default stdout callback uses stderr)
-    log_info("Logger initialized");
+    // Enable rolling log via single API, without changing other structures
+    if (add_rolling_log("rolling.log", 100, LOG_TRACE) != 0) {
+        log_error("Failed to enable rolling log");
+    }
 
-    // Normal text file logging
+    // Optional: also log to a normal file
     FILE *normal = fopen("normal.log", "w+");
     if (normal) {
         log_add_fp(normal, LOG_TRACE);
-    } else {
-        log_error("Failed to open normal.log");
     }
-
-    // Only use log_info/log_debug etc.; rolling logger is internal and automatic
 
     for (int i = 0; i < 150; i++) {
         log_info("message %03d: The quick brown fox jumps over the lazy dog.", i);
