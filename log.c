@@ -69,6 +69,7 @@ typedef struct RollingFileState {
     size_t max_lines;
     size_t current_line_index;
     bool try_remove_append_flag;
+    bool in_use;
 } RollingFileState;
 
 // 日志系统全局状态
@@ -95,6 +96,9 @@ static struct {
         int level;
     } callbacks[MAX_CALLBACKS];
 } L;
+
+// 静态滚动日志状态池，避免动态内存分配
+static RollingFileState gRollingStates[MAX_CALLBACKS];
 
 // 日志级别字符串（支持中文显示）
 static const char* level_strings[] = {
@@ -556,8 +560,14 @@ void log_uninit(void) {
         } else if (L.callbacks[i].fn == rolling_file_callback) {
             RollingFileState* state = (RollingFileState*)L.callbacks[i].udata;
             if (state) {
-                if (state->file_stream) fclose(state->file_stream);
-                free(state);
+                if (state->file_stream) {
+                    fclose(state->file_stream);
+                    state->file_stream = NULL;
+                }
+                state->in_use = false;
+                state->max_lines = 0;
+                state->current_line_index = 0;
+                state->try_remove_append_flag = false;
                 L.callbacks[i].udata = NULL;
             }
         }
@@ -598,13 +608,23 @@ void log_error(const char* file, const char* func, int line, const char* fmt, ..
 int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
     if (!fp || max_lines == 0) return -1;
 
+    // 从静态池中选择一个空闲状态
+    RollingFileState* state = NULL;
+    for (int i = 0; i < MAX_CALLBACKS; ++i) {
+        if (!gRollingStates[i].in_use) {
+            state = &gRollingStates[i];
+            break;
+        }
+    }
+    if (!state) return -1; // 无可用槽位
+
     // 初始化状态
-    RollingFileState* state = (RollingFileState*)calloc(1, sizeof(RollingFileState));
-    if (!state) return -1;
+    memset(state, 0, sizeof(*state));
     state->file_stream = fp;
     state->max_lines = max_lines;
     state->current_line_index = 0;
     state->try_remove_append_flag = true; // 第一次写前尝试移除 O_APPEND
+    state->in_use = true;
 
     // 计算当前行位置（基于文件长度）
 #if defined(LINUX)
@@ -624,7 +644,8 @@ int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
         struct stat st;
         if (fstat(fd, &st) == 0) {
             if (st.st_size < target) {
-                (void)ftruncate(fd, target);
+                int rc_trunc = ftruncate(fd, target);
+                (void)rc_trunc;
             }
         }
     }
@@ -641,7 +662,9 @@ int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
     // 注册回调
     int rc = log_add_callback(rolling_file_callback, state, level);
     if (rc != 0) {
-        free(state);
+        // 回滚占用标记
+        state->in_use = false;
+        // 不关闭 fp，由调用者或上层决定
     }
     return rc;
 }
