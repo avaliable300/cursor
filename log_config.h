@@ -1,49 +1,47 @@
-#pragma once
+#ifndef LOG_CONFIG_H
+#define LOG_CONFIG_H
 
+#include <stdbool.h>
 #include <stdio.h>
-#include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// 日志输出目标
+typedef enum {
+    LOG_TARGET_CONSOLE,
+    LOG_TARGET_FILE,
+    LOG_TARGET_BOTH
+} LogTarget;
 
-// 日志级别索引
-#define LOG_LEVEL_TRACE 0
-#define LOG_LEVEL_DEBUG 1
-#define LOG_LEVEL_INFO  2
-#define LOG_LEVEL_WARN  3
-#define LOG_LEVEL_ERROR 4
-#define LOG_LEVEL_FATAL 5
-#define LOG_LEVEL_OFF   6
+// 日志级别
+typedef enum {
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_WARN,
+    LOG_ERROR,
+    LOG_OFF
+} LogLevel;
 
-// 基础 API
-void log_log(int level, const char* file, const char* func, int line, const char* fmt, ...);
-int  log_init_config(const char* config_file, size_t buf_size, int type);
-void log_uninit(void);
+// 定义类型
+typedef enum {
+    CONFIG_TYPE_FILE,   // 表示 char* 是文件路径
+    CONFIG_TYPE_BUF     // 表示 char* 是内存缓冲区
+} ConfigType;
 
-// 固定 128 字节记录的循环日志注册函数
-int log_add_rolling_fp(FILE *fp, int level, size_t max_lines);
+// 日志配置结构体（新增颜色和锁的开关）
+typedef struct {
+    LogLevel log_level;     // 日志级别
+    LogTarget target;       // 输出目标
+    char log_file[256];     // 日志文件路径
+    bool use_color;         // 是否启用颜色（控制台和文件一致）
+    bool use_lock;          // 是否启用线程锁
+    size_t max_line;        // 最大行数
+    float max_memory;       // 最大内存，单位MB
+    int segment_count;      // log文件分割数
+} LogConfig;
 
-// 便捷宏
-#ifndef LOG_TRACE
-#define LOG_TRACE(fmt, ...) log_log(LOG_LEVEL_TRACE, __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
-#ifndef LOG_DEBUG
-#define LOG_DEBUG(fmt, ...) log_log(LOG_LEVEL_DEBUG, __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
-#ifndef LOG_INFO
-#define LOG_INFO(fmt, ...)  log_log(LOG_LEVEL_INFO,  __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
-#ifndef LOG_WARN
-#define LOG_WARN(fmt, ...)  log_log(LOG_LEVEL_WARN,  __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
-#ifndef LOG_ERROR
-#define LOG_ERROR(fmt, ...) log_log(LOG_LEVEL_ERROR, __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
-#ifndef LOG_FATAL
-#define LOG_FATAL(fmt, ...) log_log(LOG_LEVEL_FATAL, __FILE__, __func__, __LINE__, fmt, ##__VA_ARGS__)
-#endif
+// 统一接口：根据类型自动选择解析方式
+int log_load_config(const char* data, size_t buf_size, ConfigType type, LogConfig* config);
 
-#ifdef __cplusplus
-}
-#endif
+// 打印配置信息
+void log_print_config(const LogConfig* config);
+
+#endif // LOG_CONFIG_H

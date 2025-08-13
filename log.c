@@ -1,4 +1,6 @@
 #include "log_config.h"
+#include "log.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -252,21 +254,6 @@ static void lock_init(void) {
     #endif
 }
 
-// 初始化日志系统
-static void log_init(void) {
-    if (L.initialized) return;
-
-    // 默认配置
-    L.level = 2; // 假设INFO级别对应索引2，需与实际定义一致
-    L.quiet = false;
-    L.use_color = false;   // 默认不启用颜色
-    L.use_lock = false;    // 默认不启用线程锁
-    L.lock = NULL;
-    L.udata = NULL;
-    memset(L.callbacks, 0, sizeof(L.callbacks));
-    L.initialized = true;
-}
-
 // 设置静默模式
 static void log_set_quiet(bool enable) {
     if (L.use_lock) lock();
@@ -440,7 +427,7 @@ static int log_add_fp(FILE* fp, int level) {
 
 // 核心日志函数（需确保log_Event等定义完整，这里简化实现）
 void log_log(int level, const char* file, const char* func, int line, const char* fmt, ...) {
-    if (!L.initialized || L.level == 6 /* 假设OFF级别对应索引6 */) return;
+    if (!L.initialized || L.level == LOG_OFF) return;
 
     if (level < L.level) return;
 
@@ -474,16 +461,84 @@ void log_log(int level, const char* file, const char* func, int line, const char
     unlock();
 }
 
-// 模拟加载配置函数（需根据实际完善，这里返回0示意成功）
-int log_load_config(const char* config_file, size_t buf_size, int type, LogConfig* config) {
-    (void)config_file; (void)buf_size; (void)type;
-    // 实际应读取配置文件内容填充config，这里简单赋默认值示意
-    config->use_color = false;
-    config->use_lock = false;
-    config->log_level = 2; // INFO级别
-    config->target = LOG_TARGET_CONSOLE;
-    config->log_file = "app.log";
-    return 0; 
+// 添加固定  字节记录的循环日志回调
+static int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
+    if (!fp || max_lines == 0) return -1;
+
+    // 从静态池中选择一个空闲状态
+    RollingFileState* state = NULL;
+    for (int i = 0; i < MAX_CALLBACKS; ++i) {
+        if (!gRollingStates[i].in_use) {
+            state = &gRollingStates[i];
+            break;
+        }
+    }
+    if (!state) return -1; // 无可用槽位
+
+    // 根据 fseek 的可寻址范围限制 max_lines
+    unsigned long max_records_supported = (unsigned long)(LONG_MAX / ROLLING_RECORD_SIZE);
+    size_t capped_max_lines = max_lines;
+    if ((unsigned long)max_lines > max_records_supported) {
+        capped_max_lines = (size_t)max_records_supported;
+    }
+
+    // 初始化状态
+    memset(state, 0, sizeof(*state));
+    state->file_stream = fp;
+    state->max_lines = capped_max_lines;
+    state->current_line_index = 0;
+    state->try_remove_append_flag = true; // 第一次写前尝试移除 O_APPEND
+    state->in_use = true;
+
+    // 计算当前行位置（基于文件长度，使用 fseek/ftell）
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    if (len > 0) {
+        size_t records = (size_t)((unsigned long)len / (unsigned long)ROLLING_RECORD_SIZE);
+        if (records > 0 && state->max_lines > 0) {
+            state->current_line_index = records % state->max_lines;
+        }
+    }
+
+    // 可选（Linux）：预分配文件大小
+#if defined(LINUX)
+    int fd = fileno(fp);
+    if (fd >= 0) {
+        unsigned long target = (unsigned long)(state->max_lines * (size_t)ROLLING_RECORD_SIZE);
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            if (st.st_size < target) {
+                int rc_trunc = ftruncate(fd, target);
+                (void)rc_trunc;
+            }
+        }
+    }
+#endif
+
+    // 注册回调
+    int rc = log_add_callback(rolling_file_callback, state, level);
+    if (rc != 0) {
+        // 回滚占用标记
+        state->in_use = false;
+        // 关闭 fp，由调用者或上层决定
+        close(fp);
+    }
+    return rc;
+}
+
+// 初始化日志系统
+static void log_init(void) {
+    if (L.initialized) return;
+
+    // 默认配置
+    L.level = 2; // 假设INFO级别对应索引2，需与实际定义一致
+    L.quiet = false;
+    L.use_color = false;   // 默认不启用颜色
+    L.use_lock = false;    // 默认不启用线程锁
+    L.lock = NULL;
+    L.udata = NULL;
+    memset(L.callbacks, 0, sizeof(L.callbacks));
+    L.initialized = true;
 }
 
 // 从配置文件初始化日志系统
@@ -493,7 +548,7 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
     LogConfig config;
     if (log_load_config(config_file, buf_size, type, &config) != 0) {
         // 假设log_warn已实现，实际需确保调用逻辑正确
-        log_log(3, __FILE__, __func__, __LINE__, 
+        log_(3, __FILE__, __func__, __LINE__, 
                 "The configuration file fails to load, using the default configuration!!!!!");
     }
 
@@ -518,8 +573,7 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
                     log_add_fp(fp, L.level);
                 } else {
                     // 假设log_error已实现
-                    log_log(4, __FILE__, __func__, __LINE__, 
-                            "can not open log config file : %s, switch to console output", config.log_file);
+                    log_warn("can not open log config file : %s, switch to console output", config.log_file);
                     L.quiet = false;
                     return -1;
                 }
@@ -533,8 +587,7 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
                     log_add_fp(fp, L.level);
                 } else {
                     // 假设log_error已实现
-                    log_log(4, __FILE__, __func__, __LINE__, 
-                            "can not open log config file : %s, only console output: ", config.log_file);
+                    log_error("can not open log config file : %s, only console output: ", config.log_file);
                 }
             }
             break;
@@ -590,83 +643,3 @@ void log_uninit(void) {
     L.initialized = false;
 }
 
-// 以下为辅助日志函数示例（需根据实际完善，确保调用log_log逻辑正确）
-void log_warn(const char* file, const char* func, int line, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    // 注意：这里原始代码直接把 va_list 传给了可变参函数是不正确的；为保持与给定代码一致性，不在此改动签名。
-    va_end(ap);
-    log_log(3, file, func, line, fmt);
-}
-
-void log_error(const char* file, const char* func, int line, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    va_end(ap);
-    log_log(4, file, func, line, fmt);
-}
-
-// 对外暴露：添加固定 128 字节记录的循环日志回调
-int log_add_rolling_fp(FILE *fp, int level, size_t max_lines) {
-    if (!fp || max_lines == 0) return -1;
-
-    // 从静态池中选择一个空闲状态
-    RollingFileState* state = NULL;
-    for (int i = 0; i < MAX_CALLBACKS; ++i) {
-        if (!gRollingStates[i].in_use) {
-            state = &gRollingStates[i];
-            break;
-        }
-    }
-    if (!state) return -1; // 无可用槽位
-
-    // 根据 fseek 的可寻址范围限制 max_lines
-    unsigned long max_records_supported = (unsigned long)(LONG_MAX / ROLLING_RECORD_SIZE);
-    size_t capped_max_lines = max_lines;
-    if ((unsigned long)max_lines > max_records_supported) {
-        capped_max_lines = (size_t)max_records_supported;
-    }
-
-    // 初始化状态
-    memset(state, 0, sizeof(*state));
-    state->file_stream = fp;
-    state->max_lines = capped_max_lines;
-    state->current_line_index = 0;
-    state->try_remove_append_flag = true; // 第一次写前尝试移除 O_APPEND
-    state->in_use = true;
-
-    // 计算当前行位置（基于文件长度，使用 fseek/ftell）
-    fseek(fp, 0, SEEK_END);
-    long len = ftell(fp);
-    if (len > 0) {
-        size_t records = (size_t)((unsigned long)len / (unsigned long)ROLLING_RECORD_SIZE);
-        if (records > 0 && state->max_lines > 0) {
-            state->current_line_index = records % state->max_lines;
-        }
-    }
-
-    // 可选（Linux）：预分配文件大小
-#if defined(LINUX)
-    int fd = fileno(fp);
-    if (fd >= 0) {
-        unsigned long target_ul = (unsigned long)(state->max_lines * (size_t)ROLLING_RECORD_SIZE);
-        off_t target = (off_t)target_ul;
-        struct stat st;
-        if (fstat(fd, &st) == 0) {
-            if (st.st_size < target) {
-                int rc_trunc = ftruncate(fd, target);
-                (void)rc_trunc;
-            }
-        }
-    }
-#endif
-
-    // 注册回调
-    int rc = log_add_callback(rolling_file_callback, state, level);
-    if (rc != 0) {
-        // 回滚占用标记
-        state->in_use = false;
-        // 不关闭 fp，由调用者或上层决定
-    }
-    return rc;
-}
