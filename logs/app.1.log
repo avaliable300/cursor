@@ -1,12 +1,10 @@
-8: seg 1158: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1159: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1160: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1161: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1162: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1163: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1164: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1165: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1166: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1167: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1168: The quick brown fox jumps over the lazy dog.
-2025-08-13 13:55:34 INFO  main.c:18: seg 1169:
+5-08-13 14:33:13 INFO  main.c:49: cfg seg 291: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 292: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 293: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 294: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 295: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 296: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 297: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 298: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 INFO  main.c:49: cfg seg 299: The quick brown fox jumps over the lazy dog.
+2025-08-13 14:33:13 WARN  main.c:52: Done. Check logs/ and loog.log
