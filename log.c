@@ -150,6 +150,17 @@ static void segmented_open_append_if_needed(SegmentedLogCtx *ctx, int index) {
     ctx->size[index] = sz > 0 ? (size_t)sz : 0;
 }
 
+static void segmented_truncate_and_reopen_append(SegmentedLogCtx *ctx, int index) {
+    // Always start this segment fresh when rotating onto it
+    char path[512];
+    build_segment_path(ctx, index, path, sizeof(path));
+    if (ctx->fp[index]) { fclose(ctx->fp[index]); ctx->fp[index] = NULL; }
+    FILE *tmp = fopen(path, "wb");
+    if (tmp) fclose(tmp);
+    ctx->fp[index] = fopen(path, "a+b");
+    if (ctx->fp[index]) ctx->size[index] = 0; else ctx->size[index] = 0;
+}
+
 static size_t segmented_probe_size(const SegmentedLogCtx *ctx, int index) {
     char path[512];
     build_segment_path(ctx, index, path, sizeof(path));
@@ -212,8 +223,8 @@ static int segmented_init_ex(const char *dir, const char *basename, int count, s
 
 static void segmented_advance(SegmentedLogCtx *ctx) {
     ctx->current = (ctx->current + 1) % ctx->count;
-    // Lazy open next segment; do not truncate existing content
-    segmented_open_append_if_needed(ctx, ctx->current);
+    // On rotation, clear the target segment and reopen in append mode
+    segmented_truncate_and_reopen_append(ctx, ctx->current);
 }
 
 static void segmented_write_bytes(SegmentedLogCtx *ctx, const char *data, size_t len) {
