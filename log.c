@@ -232,9 +232,25 @@ static void segmented_write_bytes(SegmentedLogCtx *ctx, const char *data, size_t
 }
 
 static void segmented_write_line(SegmentedLogCtx *ctx, const char *line) {
-    size_t len = safe_strnlen(line, 65536);
-    // Ensure newline at end once
+    size_t len = safe_strnlen(line, 1048576);
     int needs_nl = (len == 0 || line[len - 1] != '\n') ? 1 : 0;
+    size_t total = len + (size_t)needs_nl;
+
+    // If the whole line fits within a single segment and not enough space remains,
+    // rotate first so the line stays complete in one file.
+    if (total <= ctx->size_limit) {
+        size_t remaining = (ctx->size[ctx->current] < ctx->size_limit)
+                             ? (ctx->size_limit - ctx->size[ctx->current])
+                             : 0;
+        if (remaining < total) {
+            segmented_advance(ctx);
+        }
+        segmented_write_bytes(ctx, line, len);
+        if (needs_nl) segmented_write_bytes(ctx, "\n", 1);
+        return;
+    }
+
+    // If the line itself exceeds a single segment, write across segments without truncation.
     segmented_write_bytes(ctx, line, len);
     if (needs_nl) segmented_write_bytes(ctx, "\n", 1);
 }
