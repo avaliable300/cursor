@@ -45,6 +45,9 @@ void log_set_quiet(bool enable);
 int log_add_callback(log_LogFn fn, void *udata, int level);
 int log_add_fp(FILE *fp, int level);
 
+// Enable segmented rotating logs: 3 files of 1KB each in the given directory, variable line size
+int add_segmented_log(const char *dir, const char *basename, int level);
+
 // Enable fixed-size (128B) rolling log to a file path without changing other structures
 int add_rolling_log(const char *path, size_t max_lines, int level);
 

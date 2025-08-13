@@ -1,0 +1,10 @@
+2025-08-13 11:31:48 INFO  main.c:21: seg 291: The quick brown fox jumps over the lazy dog 291.
+2025-08-13 11:31:48 INFO  main.c:21: seg 292: The quick brown fox jumps over the lazy dog 292.
+2025-08-13 11:31:48 INFO  main.c:21: seg 293: The quick brown fox jumps over the lazy dog 293.
+2025-08-13 11:31:48 INFO  main.c:21: seg 294: The quick brown fox jumps over the lazy dog 294.
+2025-08-13 11:31:48 INFO  main.c:21: seg 295: The quick brown fox jumps over the lazy dog 295.
+2025-08-13 11:31:48 INFO  main.c:21: seg 296: The quick brown fox jumps over the lazy dog 296.
+2025-08-13 11:31:48 INFO  main.c:21: seg 297: The quick brown fox jumps over the lazy dog 297.
+2025-08-13 11:31:48 INFO  main.c:21: seg 298: The quick brown fox jumps over the lazy dog 298.
+2025-08-13 11:31:48 INFO  main.c:21: seg 299: The quick brown fox jumps over the lazy dog 299.
+2025-08-13 11:31:48 WARN  main.c:24: Done. Check folder logs/ with app.1.log, app.2.log, app.3.log

@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 #define MAX_CALLBACKS 32
 #define LOG_FIXED_RECORD_SIZE 128
@@ -88,8 +91,22 @@ typedef struct {
     size_t valid_records; // how many records are valid (<= max_lines)
 } RollingFileCtx;
 
+// Segmented rotating log: 3 files of 1KB each
+#define SEGMENT_COUNT 3
+#define SEGMENT_SIZE_BYTES 1024
+
+typedef struct {
+    bool used;
+    char dir[256];
+    char base[128];
+    FILE *fp[SEGMENT_COUNT];
+    size_t size[SEGMENT_COUNT];
+    int current; // 0..SEGMENT_COUNT-1
+} SegmentedLogCtx;
+
 #define MAX_ROLLING_CTX 32
 static RollingFileCtx g_rolling_ctx[MAX_ROLLING_CTX];
+static SegmentedLogCtx g_segmented_ctx; // single instance for simplicity
 
 static RollingFileCtx *alloc_rolling_ctx(void) {
     for (int i = 0; i < MAX_ROLLING_CTX; ++i) {
@@ -105,20 +122,100 @@ static RollingFileCtx *alloc_rolling_ctx(void) {
     return NULL;
 }
 
+static int ensure_dir(const char *dir) {
+    if (!dir || !*dir) return -1;
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        return -1;
+    }
+    if (mkdir(dir, 0775) == 0) return 0;
+    return (errno == EEXIST) ? 0 : -1;
+}
+
+static void segmented_rotate_to(SegmentedLogCtx *ctx, int index) {
+    if (ctx->fp[index]) {
+        fclose(ctx->fp[index]);
+        ctx->fp[index] = NULL;
+    }
+    // Recreate file (destroy old content)
+    char path[512];
+    SNPRINTF(path, sizeof(path), "%s/%s.%d.log", ctx->dir, ctx->base, index + 1);
+    ctx->fp[index] = fopen(path, "w+b");
+    ctx->size[index] = 0;
+}
+
+static void segmented_advance(SegmentedLogCtx *ctx) {
+    ctx->current = (ctx->current + 1) % SEGMENT_COUNT;
+    segmented_rotate_to(ctx, ctx->current);
+}
+
+static void segmented_write_line(SegmentedLogCtx *ctx, const char *line) {
+    if (!ctx || !ctx->used) return;
+    if (!ctx->fp[ctx->current]) segmented_rotate_to(ctx, ctx->current);
+
+    size_t len = safe_strnlen(line, 4096);
+    // Add newline if not ending with one
+    int needs_nl = (len == 0 || line[len - 1] != '\n') ? 1 : 0;
+    size_t write_len = len + (size_t)needs_nl;
+
+    // Rotate if current segment would exceed size
+    if (ctx->size[ctx->current] + write_len > SEGMENT_SIZE_BYTES) {
+        segmented_advance(ctx);
+    }
+
+    // Write
+    fwrite(line, 1, len, ctx->fp[ctx->current]);
+    if (needs_nl) fputc('\n', ctx->fp[ctx->current]);
+    fflush(ctx->fp[ctx->current]);
+    ctx->size[ctx->current] += write_len;
+
+    // If exactly full, advance next time
+    if (ctx->size[ctx->current] >= SEGMENT_SIZE_BYTES) {
+        segmented_advance(ctx);
+    }
+}
+
+static void segmented_callback(log_Event *ev) {
+    if (!g_segmented_ctx.used) return;
+
+    // Timestamp + header
+    char ts[32];
+    time_t timep; time(&timep);
+    struct tm *pt = gmtime(&timep);
+    SNPRINTF(ts, sizeof(ts), "%d-%02d-%02d %02d:%02d:%02d",
+             1900 + pt->tm_year, 1 + pt->tm_mon, pt->tm_mday,
+             (8 + pt->tm_hour) % 24, pt->tm_min, pt->tm_sec);
+
+    char linebuf[2048];
+    int header_len = SNPRINTF(linebuf, sizeof(linebuf), "%s %-5s %s:%d: ",
+                              ts, level_strings[ev->level], ev->file, ev->line);
+    if (header_len < 0) header_len = 0;
+    size_t pos = (size_t)header_len;
+    if (pos > sizeof(linebuf)) pos = sizeof(linebuf);
+
+    if (pos < sizeof(linebuf)) {
+        int remain = (int)(sizeof(linebuf) - pos);
+        int wrote = vsnprintf(linebuf + pos, (size_t)remain, ev->fmt, ev->ap);
+        (void)wrote;
+    }
+
+    segmented_write_line(&g_segmented_ctx, linebuf);
+}
+
 static void rolling_file_callback(log_Event *ev) {
     RollingFileCtx *ctx = (RollingFileCtx *)ev->udata;
     if (!ctx || !ctx->used || !ctx->fp || ctx->max_lines == 0) return;
 
     // Timestamp
     char ts[32];
-    time_t timep;
-    time(&timep);
+    time_t timep; time(&timep);
     struct tm *pt = gmtime(&timep);
     SNPRINTF(ts, sizeof(ts), "%d-%02d-%02d %02d:%02d:%02d",
              1900 + pt->tm_year, 1 + pt->tm_mon, pt->tm_mday,
              (8 + pt->tm_hour) % 24, pt->tm_min, pt->tm_sec);
 
-    // Build the full line into a temporary buffer (text only)
+    // Build a full text line
     char linebuf[1024];
     int header_len = SNPRINTF(linebuf, sizeof(linebuf), "%s %-5s %s:%d: ",
                               ts, level_strings[ev->level], ev->file, ev->line);
@@ -126,19 +223,15 @@ static void rolling_file_callback(log_Event *ev) {
     size_t pos = (size_t)header_len;
     if (pos > sizeof(linebuf)) pos = sizeof(linebuf);
 
-    // Append message
     if (pos < sizeof(linebuf)) {
         int remain = (int)(sizeof(linebuf) - pos);
         int wrote = vsnprintf(linebuf + pos, (size_t)remain, ev->fmt, ev->ap);
-        if (wrote < 0) wrote = 0;
-        // Do not rely on terminating NUL; we will copy explicit length below
+        (void)wrote;
     }
 
-    // Create a 128-byte record with no NUL bytes: copy visible chars, pad with spaces, last byte is '\n'
+    // Compose fixed 128-byte record, no NUL bytes
     char record[LOG_FIXED_RECORD_SIZE];
     memset(record, ' ', sizeof(record));
-
-    // Compute visible length (stop at first NUL if any)
     size_t visible_len = safe_strnlen(linebuf, sizeof(linebuf));
     if (visible_len > LOG_FIXED_RECORD_SIZE - 1) visible_len = LOG_FIXED_RECORD_SIZE - 1;
     memcpy(record, linebuf, visible_len);
@@ -221,6 +314,28 @@ int add_rolling_log(const char *path, size_t max_lines, int level) {
     }
 
     return log_add_callback(rolling_file_callback, ctx, level);
+}
+
+int add_segmented_log(const char *dir, const char *basename, int level) {
+    if (!dir || !basename) return -1;
+    if (ensure_dir(dir) != 0) return -1;
+
+    // Initialize context if first time
+    if (!g_segmented_ctx.used) {
+        memset(&g_segmented_ctx, 0, sizeof(g_segmented_ctx));
+        g_segmented_ctx.used = true;
+        SNPRINTF(g_segmented_ctx.dir, sizeof(g_segmented_ctx.dir), "%s", dir);
+        SNPRINTF(g_segmented_ctx.base, sizeof(g_segmented_ctx.base), "%s", basename);
+        g_segmented_ctx.current = 0;
+        for (int i = 0; i < SEGMENT_COUNT; ++i) {
+            g_segmented_ctx.fp[i] = NULL;
+            g_segmented_ctx.size[i] = 0;
+            segmented_rotate_to(&g_segmented_ctx, i); // create/clear all
+        }
+        g_segmented_ctx.current = 0;
+    }
+
+    return log_add_callback(segmented_callback, NULL, level);
 }
 
 static void init_event(log_Event *ev, void *udata) {
