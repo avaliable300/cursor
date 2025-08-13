@@ -1,4 +1,5 @@
 #include "log.h"
+#include "log_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,9 +92,8 @@ typedef struct {
     size_t valid_records; // how many records are valid (<= max_lines)
 } RollingFileCtx;
 
-// Segmented rotating log: N files of 1KB each (append mode)
+// Segmented rotating log: N files of size_limit bytes (append mode)
 #define MAX_SEGMENTS 16
-#define SEGMENT_SIZE_BYTES 1024
 
 typedef struct {
     bool used;
@@ -103,6 +103,7 @@ typedef struct {
     size_t size[MAX_SEGMENTS];
     int current; // 0..count-1
     int count;   // number of segments in use
+    size_t size_limit; // per segment size limit in bytes
 } SegmentedLogCtx;
 
 #define MAX_ROLLING_CTX 32
@@ -161,8 +162,9 @@ static size_t segmented_probe_size(const SegmentedLogCtx *ctx, int index) {
     return sz > 0 ? (size_t)sz : 0;
 }
 
-static int segmented_init(const char *dir, const char *basename, int count) {
+static int segmented_init_ex(const char *dir, const char *basename, int count, size_t size_limit) {
     if (count <= 0 || count > MAX_SEGMENTS) return -1;
+    if (size_limit == 0) return -1;
     if (ensure_dir(dir) != 0) return -1;
 
     if (!g_segmented_ctx.used) {
@@ -173,6 +175,7 @@ static int segmented_init(const char *dir, const char *basename, int count) {
     SNPRINTF(g_segmented_ctx.dir, sizeof(g_segmented_ctx.dir), "%s", dir);
     SNPRINTF(g_segmented_ctx.base, sizeof(g_segmented_ctx.base), "%s", basename);
     g_segmented_ctx.count = count;
+    g_segmented_ctx.size_limit = size_limit;
 
     for (int i = 0; i < g_segmented_ctx.count; ++i) {
         // Open append and record size
@@ -187,13 +190,16 @@ static int segmented_init(const char *dir, const char *basename, int count) {
         fseek(g_segmented_ctx.fp[i], 0, SEEK_END);
         long sz = ftell(g_segmented_ctx.fp[i]);
         g_segmented_ctx.size[i] = sz > 0 ? (size_t)sz : 0;
+        if (g_segmented_ctx.size[i] > g_segmented_ctx.size_limit) {
+            segmented_truncate_and_reopen_append(&g_segmented_ctx, i);
+        }
     }
 
     // Choose current: first not full, else 0 and truncate it
     g_segmented_ctx.current = 0;
     int found = 0;
     for (int i = 0; i < g_segmented_ctx.count; ++i) {
-        if (g_segmented_ctx.size[i] < SEGMENT_SIZE_BYTES) { g_segmented_ctx.current = i; found = 1; break; }
+        if (g_segmented_ctx.size[i] < g_segmented_ctx.size_limit) { g_segmented_ctx.current = i; found = 1; break; }
     }
     if (!found) {
         segmented_truncate_and_reopen_append(&g_segmented_ctx, 0);
@@ -212,10 +218,10 @@ static void segmented_advance(SegmentedLogCtx *ctx) {
 static void segmented_write_bytes(SegmentedLogCtx *ctx, const char *data, size_t len) {
     size_t offset = 0;
     while (offset < len) {
-        if (ctx->size[ctx->current] >= SEGMENT_SIZE_BYTES) {
+        if (ctx->size[ctx->current] >= ctx->size_limit) {
             segmented_advance(ctx);
         }
-        size_t cap = SEGMENT_SIZE_BYTES - ctx->size[ctx->current];
+        size_t cap = ctx->size_limit - ctx->size[ctx->current];
         if (cap == 0) { segmented_advance(ctx); continue; }
         size_t chunk = (len - offset) < cap ? (len - offset) : cap;
         fwrite(data + offset, 1, chunk, ctx->fp[ctx->current]);
@@ -372,8 +378,40 @@ int add_rolling_log(const char *path, size_t max_lines, int level) {
     return log_add_callback(rolling_file_callback, ctx, level);
 }
 
+static void split_dir_base_from_path(const char *path, char *out_dir, size_t out_dir_sz, char *out_base, size_t out_base_sz) {
+    // default values
+    SNPRINTF(out_dir, out_dir_sz, ".");
+    SNPRINTF(out_base, out_base_sz, "log");
+    if (!path || !*path) return;
+
+    // copy path to temp
+    char tmp[512];
+    SNPRINTF(tmp, sizeof(tmp), "%s", path);
+
+    // find last slash
+    char *last_slash = NULL;
+    for (char *p = tmp; *p; ++p) {
+        if (*p == '/' || *p == '\\') last_slash = p;
+    }
+    char *fname = tmp;
+    if (last_slash) {
+        *last_slash = '\0';
+        SNPRINTF(out_dir, out_dir_sz, "%s", tmp);
+        fname = last_slash + 1;
+    }
+
+    // strip extension
+    char *dot = NULL;
+    for (char *p = fname; *p; ++p) {
+        if (*p == '.') dot = p;
+    }
+    if (dot && dot != fname) *dot = '\0';
+    SNPRINTF(out_base, out_base_sz, "%s", fname && *fname ? fname : "log");
+}
+
 int add_segmented_log(const char *dir, const char *basename, int level) {
-    if (segmented_init(dir, basename, 3) != 0) return -1;
+    // Default to 3 segments, 1KB per segment
+    if (segmented_init_ex(dir, basename, 3, 1024) != 0) return -1;
     // Avoid duplicate registration
     for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
         if (L.callbacks[i].fn == segmented_callback) return 0;
@@ -404,8 +442,32 @@ static int read_segment_count_from_config(const char *config_path) {
 int add_segmented_log_from_config(const char *dir, const char *basename, const char *config_path, int level) {
     int count = read_segment_count_from_config(config_path);
     if (count < 1) count = 3;
-    if (segmented_init(dir, basename, count) != 0) return -1;
+    if (segmented_init_ex(dir, basename, count, 1024) != 0) return -1;
     // Avoid duplicate registration
+    for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
+        if (L.callbacks[i].fn == segmented_callback) return 0;
+    }
+    return log_add_callback(segmented_callback, NULL, level);
+}
+
+int add_segmented_log_from_log_config(const LogConfig *cfg, int level) {
+    if (!cfg) return -1;
+    // Derive dir/base from cfg->log_file
+    char dir[256], base[128];
+    split_dir_base_from_path(cfg->log_file, dir, sizeof(dir), base, sizeof(base));
+
+    int count = cfg->segment_count > 0 ? cfg->segment_count : 3;
+    if (count > MAX_SEGMENTS) count = MAX_SEGMENTS;
+
+    size_t size_limit = 1024; // default 1KB
+    if (cfg->max_memory > 0 && count > 0) {
+        double total_bytes = (double)cfg->max_memory * 1024.0 * 1024.0;
+        double per_seg = total_bytes / (double)count;
+        if (per_seg >= 256.0) size_limit = (size_t)per_seg; // minimum 256B
+    }
+
+    if (segmented_init_ex(dir, base, count, size_limit) != 0) return -1;
+    // Avoid duplicate
     for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
         if (L.callbacks[i].fn == segmented_callback) return 0;
     }
