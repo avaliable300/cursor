@@ -139,16 +139,15 @@ static void build_segment_path(const SegmentedLogCtx *ctx, int index, char *out,
     SNPRINTF(out, out_size, "%s/%s.%d.log", ctx->dir, ctx->base, index + 1);
 }
 
-static void segmented_truncate_and_reopen_append(SegmentedLogCtx *ctx, int index) {
+static void segmented_open_append_if_needed(SegmentedLogCtx *ctx, int index) {
+    if (ctx->fp[index]) return;
     char path[512];
     build_segment_path(ctx, index, path, sizeof(path));
-    // Truncate first
-    FILE *tmp = fopen(path, "wb");
-    if (tmp) fclose(tmp);
-    // Reopen in append mode
-    if (ctx->fp[index]) fclose(ctx->fp[index]);
     ctx->fp[index] = fopen(path, "a+b");
-    ctx->size[index] = 0;
+    if (!ctx->fp[index]) return;
+    fseek(ctx->fp[index], 0, SEEK_END);
+    long sz = ftell(ctx->fp[index]);
+    ctx->size[index] = sz > 0 ? (size_t)sz : 0;
 }
 
 static size_t segmented_probe_size(const SegmentedLogCtx *ctx, int index) {
@@ -178,21 +177,23 @@ static int segmented_init_ex(const char *dir, const char *basename, int count, s
     g_segmented_ctx.size_limit = size_limit;
 
     for (int i = 0; i < g_segmented_ctx.count; ++i) {
-        // Open append and record size
+        // Probe existing size without creating files
         char path[512];
         build_segment_path(&g_segmented_ctx, i, path, sizeof(path));
         if (g_segmented_ctx.fp[i]) {
             fclose(g_segmented_ctx.fp[i]);
             g_segmented_ctx.fp[i] = NULL;
         }
-        g_segmented_ctx.fp[i] = fopen(path, "a+b");
-        if (!g_segmented_ctx.fp[i]) return -1;
-        fseek(g_segmented_ctx.fp[i], 0, SEEK_END);
-        long sz = ftell(g_segmented_ctx.fp[i]);
-        g_segmented_ctx.size[i] = sz > 0 ? (size_t)sz : 0;
-        if (g_segmented_ctx.size[i] > g_segmented_ctx.size_limit) {
-            segmented_truncate_and_reopen_append(&g_segmented_ctx, i);
+        FILE *rf = fopen(path, "rb");
+        if (rf) {
+            fseek(rf, 0, SEEK_END);
+            long sz = ftell(rf);
+            fclose(rf);
+            g_segmented_ctx.size[i] = sz > 0 ? (size_t)sz : 0;
+        } else {
+            g_segmented_ctx.size[i] = 0;
         }
+        // Do not create or truncate here; create lazily on first write
     }
 
     // Choose current: first not full, else 0 and truncate it
@@ -211,15 +212,17 @@ static int segmented_init_ex(const char *dir, const char *basename, int count, s
 
 static void segmented_advance(SegmentedLogCtx *ctx) {
     ctx->current = (ctx->current + 1) % ctx->count;
-    // On rotation, destroy next file and reopen in append with size reset
-    segmented_truncate_and_reopen_append(ctx, ctx->current);
+    // Lazy open next segment; do not truncate existing content
+    segmented_open_append_if_needed(ctx, ctx->current);
 }
 
 static void segmented_write_bytes(SegmentedLogCtx *ctx, const char *data, size_t len) {
     size_t offset = 0;
     while (offset < len) {
+        segmented_open_append_if_needed(ctx, ctx->current);
         if (ctx->size[ctx->current] >= ctx->size_limit) {
             segmented_advance(ctx);
+            segmented_open_append_if_needed(ctx, ctx->current);
         }
         size_t cap = ctx->size_limit - ctx->size[ctx->current];
         if (cap == 0) { segmented_advance(ctx); continue; }
