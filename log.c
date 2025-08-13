@@ -548,8 +548,7 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
     LogConfig config;
     if (log_load_config(config_file, buf_size, type, &config) != 0) {
         // 假设log_warn已实现，实际需确保调用逻辑正确
-        log_(3, __FILE__, __func__, __LINE__, 
-                "The configuration file fails to load, using the default configuration!!!!!");
+        log_warn("The configuration file fails to load, using the default configuration!!!!!");
     }
 
     // 应用配置
@@ -564,10 +563,36 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
     switch (config.target) {
         case LOG_TARGET_CONSOLE:
             L.quiet = false;
+            FILE* rfp = fopen("rolling.log", "w+b");
+            if (!rfp) {
+                perror("open rolling.log");
+                return 1;
+            }
+
+            // 注册循环日志：每条 128 字节，最多 100 条
+            // 假设 config 是 LogConfig 类型的变量，需确保已正确初始化
+            if (log_add_rolling_fp(rfp, config.log_level, 1000) != 0) {
+                fprintf(stderr, "failed to add rolling logger\n");
+                fclose(rfp);
+                return 1;
+            }
             break;
         case LOG_TARGET_FILE:
             L.quiet = true;
             {
+            FILE* rfp = fopen("rolling.log", "w+b");
+            if (!rfp) {
+                perror("open rolling.log");
+                return 1;
+            }
+
+            // 注册循环日志：每条 128 字节，最多 100 条
+            // 假设 config 是 LogConfig 类型的变量，需确保已正确初始化
+            if (log_add_rolling_fp(rfp, config.log_level, 1000) != 0) {
+                fprintf(stderr, "failed to add rolling logger\n");
+                fclose(rfp);
+                return 1;
+            }
                 FILE* fp = fopen(config.log_file, "a"); 
                 if (fp) {
                     log_add_fp(fp, L.level);
@@ -582,6 +607,19 @@ int log_init_config(const char* config_file, size_t buf_size, int type) {
         case LOG_TARGET_BOTH:
             L.quiet = false;
             {
+            FILE* rfp = fopen("rolling.log", "w+b");
+            if (!rfp) {
+                perror("open rolling.log");
+                return 1;
+            }
+
+            // 注册循环日志：每条 128 字节，最多 100 条
+            // 假设 config 是 LogConfig 类型的变量，需确保已正确初始化
+            if (log_add_rolling_fp(rfp, config.log_level, 1000) != 0) {
+                fprintf(stderr, "failed to add rolling logger\n");
+                fclose(rfp);
+                return 1;
+            }
                 FILE* fp = fopen(config.log_file, "a"); 
                 if (fp) {
                     log_add_fp(fp, L.level);
@@ -642,4 +680,5 @@ void log_uninit(void) {
 
     L.initialized = false;
 }
+
 
