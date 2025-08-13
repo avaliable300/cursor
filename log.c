@@ -91,17 +91,18 @@ typedef struct {
     size_t valid_records; // how many records are valid (<= max_lines)
 } RollingFileCtx;
 
-// Segmented rotating log: 3 files of 1KB each
-#define SEGMENT_COUNT 3
+// Segmented rotating log: N files of 1KB each (append mode)
+#define MAX_SEGMENTS 16
 #define SEGMENT_SIZE_BYTES 1024
 
 typedef struct {
     bool used;
     char dir[256];
     char base[128];
-    FILE *fp[SEGMENT_COUNT];
-    size_t size[SEGMENT_COUNT];
-    int current; // 0..SEGMENT_COUNT-1
+    FILE *fp[MAX_SEGMENTS];
+    size_t size[MAX_SEGMENTS];
+    int current; // 0..count-1
+    int count;   // number of segments in use
 } SegmentedLogCtx;
 
 #define MAX_ROLLING_CTX 32
@@ -133,47 +134,103 @@ static int ensure_dir(const char *dir) {
     return (errno == EEXIST) ? 0 : -1;
 }
 
-static void segmented_rotate_to(SegmentedLogCtx *ctx, int index) {
-    if (ctx->fp[index]) {
-        fclose(ctx->fp[index]);
-        ctx->fp[index] = NULL;
-    }
-    // Recreate file (destroy old content)
+static void build_segment_path(const SegmentedLogCtx *ctx, int index, char *out, size_t out_size) {
+    SNPRINTF(out, out_size, "%s/%s.%d.log", ctx->dir, ctx->base, index + 1);
+}
+
+static void segmented_truncate_and_reopen_append(SegmentedLogCtx *ctx, int index) {
     char path[512];
-    SNPRINTF(path, sizeof(path), "%s/%s.%d.log", ctx->dir, ctx->base, index + 1);
-    ctx->fp[index] = fopen(path, "w+b");
+    build_segment_path(ctx, index, path, sizeof(path));
+    // Truncate first
+    FILE *tmp = fopen(path, "wb");
+    if (tmp) fclose(tmp);
+    // Reopen in append mode
+    if (ctx->fp[index]) fclose(ctx->fp[index]);
+    ctx->fp[index] = fopen(path, "a+b");
     ctx->size[index] = 0;
 }
 
+static size_t segmented_probe_size(const SegmentedLogCtx *ctx, int index) {
+    char path[512];
+    build_segment_path(ctx, index, path, sizeof(path));
+    FILE *f = fopen(path, "a+b"); // create if not exist
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    return sz > 0 ? (size_t)sz : 0;
+}
+
+static int segmented_init(const char *dir, const char *basename, int count) {
+    if (count <= 0 || count > MAX_SEGMENTS) return -1;
+    if (ensure_dir(dir) != 0) return -1;
+
+    if (!g_segmented_ctx.used) {
+        memset(&g_segmented_ctx, 0, sizeof(g_segmented_ctx));
+        g_segmented_ctx.used = true;
+    }
+
+    SNPRINTF(g_segmented_ctx.dir, sizeof(g_segmented_ctx.dir), "%s", dir);
+    SNPRINTF(g_segmented_ctx.base, sizeof(g_segmented_ctx.base), "%s", basename);
+    g_segmented_ctx.count = count;
+
+    for (int i = 0; i < g_segmented_ctx.count; ++i) {
+        // Open append and record size
+        char path[512];
+        build_segment_path(&g_segmented_ctx, i, path, sizeof(path));
+        if (g_segmented_ctx.fp[i]) {
+            fclose(g_segmented_ctx.fp[i]);
+            g_segmented_ctx.fp[i] = NULL;
+        }
+        g_segmented_ctx.fp[i] = fopen(path, "a+b");
+        if (!g_segmented_ctx.fp[i]) return -1;
+        fseek(g_segmented_ctx.fp[i], 0, SEEK_END);
+        long sz = ftell(g_segmented_ctx.fp[i]);
+        g_segmented_ctx.size[i] = sz > 0 ? (size_t)sz : 0;
+    }
+
+    // Choose current: first not full, else 0 and truncate it
+    g_segmented_ctx.current = 0;
+    int found = 0;
+    for (int i = 0; i < g_segmented_ctx.count; ++i) {
+        if (g_segmented_ctx.size[i] < SEGMENT_SIZE_BYTES) { g_segmented_ctx.current = i; found = 1; break; }
+    }
+    if (!found) {
+        segmented_truncate_and_reopen_append(&g_segmented_ctx, 0);
+        g_segmented_ctx.current = 0;
+    }
+
+    return 0;
+}
+
 static void segmented_advance(SegmentedLogCtx *ctx) {
-    ctx->current = (ctx->current + 1) % SEGMENT_COUNT;
-    segmented_rotate_to(ctx, ctx->current);
+    ctx->current = (ctx->current + 1) % ctx->count;
+    // On rotation, destroy next file and reopen in append with size reset
+    segmented_truncate_and_reopen_append(ctx, ctx->current);
+}
+
+static void segmented_write_bytes(SegmentedLogCtx *ctx, const char *data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        if (ctx->size[ctx->current] >= SEGMENT_SIZE_BYTES) {
+            segmented_advance(ctx);
+        }
+        size_t cap = SEGMENT_SIZE_BYTES - ctx->size[ctx->current];
+        if (cap == 0) { segmented_advance(ctx); continue; }
+        size_t chunk = (len - offset) < cap ? (len - offset) : cap;
+        fwrite(data + offset, 1, chunk, ctx->fp[ctx->current]);
+        fflush(ctx->fp[ctx->current]);
+        ctx->size[ctx->current] += chunk;
+        offset += chunk;
+    }
 }
 
 static void segmented_write_line(SegmentedLogCtx *ctx, const char *line) {
-    if (!ctx || !ctx->used) return;
-    if (!ctx->fp[ctx->current]) segmented_rotate_to(ctx, ctx->current);
-
-    size_t len = safe_strnlen(line, 4096);
-    // Add newline if not ending with one
+    size_t len = safe_strnlen(line, 65536);
+    // Ensure newline at end once
     int needs_nl = (len == 0 || line[len - 1] != '\n') ? 1 : 0;
-    size_t write_len = len + (size_t)needs_nl;
-
-    // Rotate if current segment would exceed size
-    if (ctx->size[ctx->current] + write_len > SEGMENT_SIZE_BYTES) {
-        segmented_advance(ctx);
-    }
-
-    // Write
-    fwrite(line, 1, len, ctx->fp[ctx->current]);
-    if (needs_nl) fputc('\n', ctx->fp[ctx->current]);
-    fflush(ctx->fp[ctx->current]);
-    ctx->size[ctx->current] += write_len;
-
-    // If exactly full, advance next time
-    if (ctx->size[ctx->current] >= SEGMENT_SIZE_BYTES) {
-        segmented_advance(ctx);
-    }
+    segmented_write_bytes(ctx, line, len);
+    if (needs_nl) segmented_write_bytes(ctx, "\n", 1);
 }
 
 static void segmented_callback(log_Event *ev) {
@@ -187,7 +244,7 @@ static void segmented_callback(log_Event *ev) {
              1900 + pt->tm_year, 1 + pt->tm_mon, pt->tm_mday,
              (8 + pt->tm_hour) % 24, pt->tm_min, pt->tm_sec);
 
-    char linebuf[2048];
+    char linebuf[4096];
     int header_len = SNPRINTF(linebuf, sizeof(linebuf), "%s %-5s %s:%d: ",
                               ts, level_strings[ev->level], ev->file, ev->line);
     if (header_len < 0) header_len = 0;
@@ -196,8 +253,7 @@ static void segmented_callback(log_Event *ev) {
 
     if (pos < sizeof(linebuf)) {
         int remain = (int)(sizeof(linebuf) - pos);
-        int wrote = vsnprintf(linebuf + pos, (size_t)remain, ev->fmt, ev->ap);
-        (void)wrote;
+        (void)vsnprintf(linebuf + pos, (size_t)remain, ev->fmt, ev->ap);
     }
 
     segmented_write_line(&g_segmented_ctx, linebuf);
@@ -317,24 +373,42 @@ int add_rolling_log(const char *path, size_t max_lines, int level) {
 }
 
 int add_segmented_log(const char *dir, const char *basename, int level) {
-    if (!dir || !basename) return -1;
-    if (ensure_dir(dir) != 0) return -1;
-
-    // Initialize context if first time
-    if (!g_segmented_ctx.used) {
-        memset(&g_segmented_ctx, 0, sizeof(g_segmented_ctx));
-        g_segmented_ctx.used = true;
-        SNPRINTF(g_segmented_ctx.dir, sizeof(g_segmented_ctx.dir), "%s", dir);
-        SNPRINTF(g_segmented_ctx.base, sizeof(g_segmented_ctx.base), "%s", basename);
-        g_segmented_ctx.current = 0;
-        for (int i = 0; i < SEGMENT_COUNT; ++i) {
-            g_segmented_ctx.fp[i] = NULL;
-            g_segmented_ctx.size[i] = 0;
-            segmented_rotate_to(&g_segmented_ctx, i); // create/clear all
-        }
-        g_segmented_ctx.current = 0;
+    if (segmented_init(dir, basename, 3) != 0) return -1;
+    // Avoid duplicate registration
+    for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
+        if (L.callbacks[i].fn == segmented_callback) return 0;
     }
+    return log_add_callback(segmented_callback, NULL, level);
+}
 
+static int read_segment_count_from_config(const char *config_path) {
+    FILE *f = fopen(config_path, "r");
+    if (!f) return -1;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    // Parse first integer in buffer
+    int count = -1;
+    for (size_t i = 0; i < n; ++i) {
+        if (buf[i] >= '0' && buf[i] <= '9') {
+            count = (int)strtol(&buf[i], NULL, 10);
+            break;
+        }
+    }
+    if (count < 1) count = 3;
+    if (count > MAX_SEGMENTS) count = MAX_SEGMENTS;
+    return count;
+}
+
+int add_segmented_log_from_config(const char *dir, const char *basename, const char *config_path, int level) {
+    int count = read_segment_count_from_config(config_path);
+    if (count < 1) count = 3;
+    if (segmented_init(dir, basename, count) != 0) return -1;
+    // Avoid duplicate registration
+    for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
+        if (L.callbacks[i].fn == segmented_callback) return 0;
+    }
     return log_add_callback(segmented_callback, NULL, level);
 }
 

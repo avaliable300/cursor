@@ -47,6 +47,7 @@ int log_add_fp(FILE *fp, int level);
 
 // Enable segmented rotating logs: 3 files of 1KB each in the given directory, variable line size
 int add_segmented_log(const char *dir, const char *basename, int level);
+int add_segmented_log_from_config(const char *dir, const char *basename, const char *config_path, int level);
 
 // Enable fixed-size (128B) rolling log to a file path without changing other structures
 int add_rolling_log(const char *path, size_t max_lines, int level);

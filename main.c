@@ -6,22 +6,19 @@
 int main(void) {
     log_set_level(LOG_TRACE);
 
-    // Segmented logs: create dir and write 3 files x 1KB rotating
-    if (add_segmented_log("logs", "app", LOG_TRACE) != 0) {
-        log_error("Failed to enable segmented log");
+    // Example config: write a number like 5 into logs.cfg to set segment count (capped to 16)
+    FILE *cfg = fopen("logs.cfg", "w");
+    if (cfg) { fprintf(cfg, "5\n"); fclose(cfg); }
+
+    if (add_segmented_log_from_config("logs", "app", "logs.cfg", LOG_TRACE) != 0) {
+        log_error("Failed to enable segmented log from config");
     }
 
-    // Optional also normal file log
-    FILE *normal = fopen("normal.log", "w+");
-    if (normal) {
-        log_add_fp(normal, LOG_TRACE);
+    for (int i = 0; i < 1200; i++) {
+        log_info("seg %04d: The quick brown fox jumps over the lazy dog.", i);
     }
 
-    for (int i = 0; i < 300; i++) {
-        log_info("seg %03d: The quick brown fox jumps over the lazy dog %d.", i, i);
-    }
-
-    log_warn("Done. Check folder logs/ with app.1.log, app.2.log, app.3.log");
+    log_warn("Done. Check folder logs/ with N×1KB files as per logs.cfg");
 
     return 0;
 }

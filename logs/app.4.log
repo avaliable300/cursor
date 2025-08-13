@@ -1,0 +1,10 @@
+ps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1192: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1193: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1194: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1195: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1196: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1197: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1198: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 INFO  main.c:18: seg 1199: The quick brown fox jumps over the lazy dog.
+2025-08-13 13:55:34 WARN  main.c:21: Done. Check folder logs/ with N×1KB files as per logs.cfg
